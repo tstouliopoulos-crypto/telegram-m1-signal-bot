@@ -28,8 +28,8 @@ def analyse(cs):
     if down>=5 and down>up:return 'DOWN','Τάση + pullback + bearish επιβεβαίωση',min(95,70+down*4)
     return 'WAIT','Δεν υπάρχει αρκετή επιβεβαίωση',0
 def get_candles(symbol):
-    r=requests.get('https://api.binance.com/api/v3/klines',params={'symbol':symbol,'interval':'1m','limit':80},timeout=10);r.raise_for_status()
-    return [{'time':int(x[0]),'open':float(x[1]),'close':float(x[4])} for x in r.json()]
+        r=requests.get('https://otcharts.com/v1/candles',headers={'Authorization':f"Bearer {os.getenv('OTCHARTS_API_KEY','')}"},params={'venue':'otc','symbol':symbol,'tf':60,'limit':50},timeout=15)
+    return [{'time':int(x['time']),'open':float(x['open']),'close':float(x['close'])} for x in r.json()['candles']]
 def loop():
     while True:
         for symbol in SYMBOLS:
