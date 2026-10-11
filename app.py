@@ -1,49 +1,182 @@
-import os,time,threading,requests
-from flask import Flask,jsonify
-app=Flask(__name__)
-BOT_TOKEN=os.getenv('BOT_TOKEN',''); CHAT_ID=os.getenv('CHAT_ID',''); SYMBOLS=['BTCUSDT','ETHUSDT','SOLUSDT']; seen={}
-def send(text):
-    if not BOT_TOKEN or not CHAT_ID: print('Telegram credentials not configured'); return
-    requests.post(f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',data={'chat_id':CHAT_ID,'text':text},timeout=10)
-def ema(v,n):
-    if len(v)<n:return None
-    k=2/(n+1);e=v[0]
-    for x in v[1:]:e=x*k+e*(1-k)
-    return e
-def analyse(cs):
-    c=cs[:-1]
-    if len(c)<30:return 'WAIT','Λίγα candles',0
-    closes=[x['close'] for x in c]; f,s=ema(closes[-30:],9),ema(closes[-30:],21); last,prev=c[-1],c[-2]
-    body=lambda x:abs(x['close']-x['open']); avg=sum(body(x) for x in c[-11:-1])/10; up=down=0
-    if f>s:up+=2
-    if f<s:down+=2
-    if last['close']>f:up+=1
-    if last['close']<f:down+=1
-    if f>s and prev['close']<prev['open'] and last['close']>last['open']:up+=2
-    if f<s and prev['close']>prev['open'] and last['close']<last['open']:down+=2
-    if last['close']>last['open'] and body(last)>=avg*.8:up+=1
-    if last['close']<last['open'] and body(last)>=avg*.8:down+=1
-    if body(last)>avg*2.5:return 'WAIT','Μεγάλο candle — αποφυγή',0
-    if up>=5 and up>down:return 'UP','Τάση + pullback + bullish επιβεβαίωση',min(95,70+up*4)
-    if down>=5 and down>up:return 'DOWN','Τάση + pullback + bearish επιβεβαίωση',min(95,70+down*4)
-    return 'WAIT','Δεν υπάρχει αρκετή επιβεβαίωση',0
-def get_candles(symbol):
-    r=requests.get('https://otcharts.com/v1/candles',headers={'Authorization':f"Bearer {os.getenv('OTCHARTS_API_KEY','')}"},params={'venue':'otc','symbol':symbol,'tf':60,'limit':50},timeout=15)
-    return [{'time':int(x['time']),'open':float(x['open']),'close':float(x['close'])} for x in r.json()['candles']]
+import os
+import time
+import threading
+import requests
+from flask import Flask, jsonify
+
+app = Flask(__name__)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID = os.getenv("CHAT_ID", "")
+API_KEY = os.getenv("OTCHARTS_API_KEY", "")
+
+SYMBOL = "EURUSD_otc"
+last_candle = None
+
+
+def send_message(text):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Telegram credentials missing")
+        return
+
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": text},
+            timeout=15
+        )
+        print("Telegram response:", r.status_code, r.text[:200])
+    except Exception as e:
+        print("Telegram error:", str(e))
+
+
+def get_candles():
+    if not API_KEY:
+        raise RuntimeError("OTCHARTS_API_KEY is missing")
+
+    r = requests.get(
+        "https://otcharts.com/v1/candles",
+        headers={"Authorization": f"Bearer {API_KEY}"},
+        params={
+            "venue": "otc",
+            "symbol": SYMBOL,
+            "tf": 60,
+            "limit": 50
+        },
+        timeout=20
+    )
+
+    r.raise_for_status()
+    data = r.json()
+    candles = data.get("candles", [])
+
+    if not candles:
+        raise RuntimeError("API returned no candles")
+
+    return [
+        {
+            "time": int(x["time"]),
+            "open": float(x["open"]),
+            "close": float(x["close"])
+        }
+        for x in candles
+    ]
+
+
+def ema(values, period):
+    if len(values) < period:
+        return None
+
+    result = values[0]
+    k = 2 / (period + 1)
+
+    for value in values[1:]:
+        result = value * k + result * (1 - k)
+
+    return result
+
+
+def analyse(candles):
+    # Ignore the currently forming candle.
+    closed = candles[:-1]
+
+    if len(closed) < 30:
+        return "WAIT", "Not enough candles"
+
+    closes = [c["close"] for c in closed]
+    fast = ema(closes[-30:], 9)
+    slow = ema(closes[-30:], 21)
+
+    previous = closed[-2]
+    last = closed[-1]
+
+    if fast is None or slow is None:
+        return "WAIT", "EMA unavailable"
+
+    body = abs(last["close"] - last["open"])
+    bodies = [
+        abs(c["close"] - c["open"])
+        for c in closed[-11:-1]
+    ]
+    average_body = sum(bodies) / len(bodies) if bodies else 0
+
+    if average_body and body > average_body * 2.5:
+        return "WAIT", "Large candle; avoid entry"
+
+    if (
+        fast > slow
+        and previous["close"] < previous["open"]
+        and last["close"] > last["open"]
+        and last["close"] > fast
+    ):
+        return "UP", "Bullish EMA and candle confirmation"
+
+    if (
+        fast < slow
+        and previous["close"] > previous["open"]
+        and last["close"] < last["open"]
+        and last["close"] < fast
+    ):
+        return "DOWN", "Bearish EMA and candle confirmation"
+
+    return "WAIT", "No clear confirmation"
+
+
 def loop():
+    global last_candle
+
     while True:
-        for symbol in SYMBOLS:
-            try:
-                cs=get_candles(symbol); closed=cs[-2]['time']
-                if seen.get(symbol)==closed:continue
-                seen[symbol]=closed; sig,reason,conf=analyse(cs)
-                if sig in ('UP','DOWN'):
-                    icon='🟢' if sig=='UP' else '🔴';send(f'{icon} {sig}\n{symbol}\n⏱️ M1\nFilter: {conf}%\n{reason}\n⚠️ DEMO / SIGNAL ONLY');print(symbol,sig,conf)
-            except Exception as e:print('ERROR',symbol,e)
-        time.sleep(5)
-@app.get('/')
-def home():return jsonify({'status':'online','service':'Telegram M1 Signal Bot','mode':'signal-only'})
-@app.get('/health')
-def health():return 'OK',200
-threading.Thread(target=loop,daemon=True).start()
-if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','10000')))
+        try:
+            candles = get_candles()
+
+            if len(candles) < 3:
+                raise RuntimeError("Not enough candle data")
+
+            closed_time = candles[-2]["time"]
+
+            if closed_time != last_candle:
+                last_candle = closed_time
+                signal, reason = analyse(candles)
+
+                if signal in ("UP", "DOWN"):
+                    message = (
+                        f"{'🟢' if signal == 'UP' else '🔴'} "
+                        f"{signal}\n"
+                        f"EUR/USD OTC\n"
+                        f"Timeframe: M1\n"
+                        f"Reason: {reason}\n"
+                        f"Signal only — DEMO first"
+                    )
+                    send_message(message)
+                    print(message)
+                else:
+                    print("WAIT:", reason)
+
+        except Exception as e:
+            print("BOT ERROR:", str(e))
+
+        # One API request per minute; check your API quota.
+        time.sleep(60)
+
+
+@app.get("/")
+def home():
+    return jsonify({
+        "status": "online",
+        "service": "Telegram M1 Signal Bot",
+        "symbol": SYMBOL,
+        "mode": "signal-only"
+    })
+
+
+@app.get("/health")
+def health():
+    return "OK", 200
+
+
+if __name__ == "__main__":
+    threading.Thread(target=loop, daemon=True).start()
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "10000"))
+    )
